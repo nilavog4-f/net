@@ -140,9 +140,14 @@ launch_port_scanner() {
   read -r -p "$(printf "  ${LW}Start port [1]: ${RST}")" sp
   read -r -p "$(printf "  ${LW}End port [1024]: ${RST}")" ep
   sp="${sp:-1}"; ep="${ep:-1024}"
+  read -r -p "$(printf "  ${LW}Also scan UDP? (y/N): ${RST}")" udp_ans
 
   echo ""
-  "$PYBIN" port_scanner.py "$target" --start-port "$sp" --end-port "$ep"
+  if [[ "$udp_ans" =~ ^[Yy]$ ]]; then
+    "$PYBIN" port_scanner.py "$target" --start-port "$sp" --end-port "$ep" --udp
+  else
+    "$PYBIN" port_scanner.py "$target" --start-port "$sp" --end-port "$ep"
+  fi
   pause_return "$?" "Port Scanner"
 }
 
