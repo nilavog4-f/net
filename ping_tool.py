@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 
-from rich.console import Console
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
@@ -135,7 +135,80 @@ def build_table(rows: list[tuple[int, float | None]], mode: str) -> Table:
     return table
 
 
-def summarize(host: str, target_display: str, rows: list[tuple[int, float | None]], mode: str):
+class FloodDetector:
+    """Watches the live ping stream for a sudden onset of heavy loss/latency
+    spikes after an established stable baseline - the signature of a target
+    getting flooded (DDoS'd) or its link getting saturated, as opposed to it
+    just always being a bit laggy from the start."""
+
+    BASELINE_SAMPLES = 5
+    WINDOW = 8
+    SPIKE_MULTIPLIER = 4.0
+    MIN_SPIKE_MS = 40.0
+
+    def __init__(self):
+        self.baseline_ms: float | None = None
+        self.under_attack = False
+        self.ever_flagged = False
+        self.first_flag_seq: int | None = None
+
+    def _is_spike(self, ms: float | None) -> bool:
+        if self.baseline_ms is None:
+            return False
+        if ms is None:
+            return True
+        threshold = max(self.baseline_ms * self.SPIKE_MULTIPLIER, self.baseline_ms + self.MIN_SPIKE_MS)
+        return ms > threshold
+
+    def update(self, rows: list[tuple[int, float | None]]) -> str:
+        """Feed the full rows list so far, return current status label."""
+        successes = [ms for _, ms in rows if ms is not None]
+
+        if self.baseline_ms is None and len(successes) >= self.BASELINE_SAMPLES:
+            # Lock in the baseline from the first clean samples only, before
+            # any spikes could have skewed it.
+            self.baseline_ms = statistics.median(successes[: self.BASELINE_SAMPLES])
+
+        if self.baseline_ms is None:
+            return "WARMING UP"
+
+        window = rows[-self.WINDOW:]
+        if len(window) < 4:
+            return "STABLE" if not self.under_attack else "UNDER ATTACK"
+
+        spikes = sum(1 for _, ms in window if self._is_spike(ms))
+        spike_ratio = spikes / len(window)
+
+        if spike_ratio >= 0.5:
+            if not self.under_attack:
+                self.first_flag_seq = rows[-1][0]
+            self.under_attack = True
+            self.ever_flagged = True
+        elif spike_ratio <= 0.2:
+            # Recovered - stop showing the alert, but remember it happened
+            self.under_attack = False
+
+        return "UNDER ATTACK" if self.under_attack else "STABLE"
+
+
+def build_status_banner(status: str) -> Text | None:
+    if status == "UNDER ATTACK":
+        return Text(
+            "  \u26a0  POSSIBLE FLOOD / DDoS DETECTED - sudden heavy packet loss & latency spikes  \u26a0  ",
+            style="bold white on red",
+            justify="center",
+        )
+    return None
+
+
+def summarize(
+    host: str,
+    target_display: str,
+    rows: list[tuple[int, float | None]],
+    mode: str,
+    detector: "FloodDetector | None" = None,
+    interrupted: bool = False,
+):
     successes = [ms for _, ms in rows if ms is not None]
     total = len(rows)
     lost = total - len(successes)
@@ -147,19 +220,36 @@ def summarize(host: str, target_display: str, rows: list[tuple[int, float | None
     jitter_ms = statistics.pstdev(successes) if len(successes) > 1 else 0.0
 
     label, style = classify_stability(loss_pct, jitter_ms, avg_ms)
+    flood_detected = bool(detector and detector.ever_flagged)
 
     lines = [f"[bold]Target:[/bold] {target_display}"]
+    if interrupted:
+        lines.append(f"[bold]Pings sent:[/bold] {total} [dim](stopped early with Ctrl+C)[/dim]")
     if avg_ms is not None:
         lines.append(f"[bold]Average ping:[/bold] {avg_ms:.0f} ms")
         lines.append(f"[bold]Min / Max:[/bold] {min_ms:.0f} ms / {max_ms:.0f} ms")
         lines.append(f"[bold]Jitter:[/bold] {jitter_ms:.1f} ms")
     else:
         lines.append("[bold]Average ping:[/bold] n/a")
+    if detector and detector.baseline_ms is not None:
+        lines.append(f"[bold]Baseline ping:[/bold] {detector.baseline_ms:.0f} ms")
     lines.append(f"[bold]Packet/connection loss:[/bold] {loss_pct:.0f}% ({lost}/{total})")
     lines.append("")
+
+    if flood_detected:
+        alert_style = "bold white on red"
+        lines.append(f"[{alert_style}] \u26a0  POSSIBLE FLOOD / DDoS DETECTED  \u26a0 [/{alert_style}]")
+        seq_note = f" around ping #{detector.first_flag_seq}" if detector.first_flag_seq else ""
+        lines.append(
+            f"[dim]Latency/loss spiked hard{seq_note} well above the connection's own baseline "
+            f"({detector.baseline_ms:.0f} ms) - that pattern (sudden mass timeouts/latency after a "
+            "clean start) is typical of the link or server being flooded, not normal network jitter.[/dim]"
+        )
+        lines.append("")
+
     lines.append(f"[{style}]STATUS: {label}[/{style}]")
 
-    if mode == "tcp" and label in ("STABLE",):
+    if mode == "tcp" and label in ("STABLE",) and not flood_detected:
         lines.append("[dim]Good enough for gameplay, e.g. Minecraft, with minimal lag.[/dim]")
     elif label == "UNSTABLE":
         lines.append("[dim]Expect noticeable lag / rubber-banding on real-time games.[/dim]")
@@ -168,7 +258,8 @@ def summarize(host: str, target_display: str, rows: list[tuple[int, float | None
     elif label == "UNREACHABLE":
         lines.append("[dim]Host did not respond at all - check the address/port or try --port for game servers.[/dim]")
 
-    console.print(Panel("\n".join(lines), title="Summary", border_style=style.split()[-1]))
+    border_style = "red" if flood_detected else style.split()[-1]
+    console.print(Panel("\n".join(lines), title="Summary", border_style=border_style))
 
 
 def run(host: str, port: int | None, count: int, interval: float):
@@ -189,26 +280,39 @@ def run(host: str, port: int | None, count: int, interval: float):
     else:
         console.print(f"[cyan]Pinging {target_display} via ICMP...[/cyan]\n")
 
-    rows: list[tuple[int, float | None]] = []
+    console.print("[dim]Press Ctrl+C at any time to stop early and see the stability summary.[/dim]\n")
 
-    with Live(build_table(rows, mode), console=console, refresh_per_second=8) as live:
-        for seq in range(1, count + 1):
-            if port:
-                ms = tcp_ping_once(resolved, port)
-            else:
-                ms = icmp_ping_once(resolved)
-                if ms is None and seq == 1:
-                    # ICMP likely blocked (common for cloud/game hosts) - hint once, keep going
-                    pass
-            rows.append((seq, ms))
-            live.update(build_table(rows, mode))
-            if seq < count:
-                time.sleep(interval)
+    rows: list[tuple[int, float | None]] = []
+    detector = FloodDetector()
+    interrupted = False
+
+    def render(status: str):
+        table = build_table(rows, mode)
+        alert = build_status_banner(status)
+        if alert is not None:
+            return Group(alert, table)
+        return table
+
+    try:
+        with Live(render("WARMING UP"), console=console, refresh_per_second=8) as live:
+            for seq in range(1, count + 1):
+                if port:
+                    ms = tcp_ping_once(resolved, port)
+                else:
+                    ms = icmp_ping_once(resolved)
+                rows.append((seq, ms))
+                status = detector.update(rows)
+                live.update(render(status))
+                if seq < count:
+                    time.sleep(interval)
+    except KeyboardInterrupt:
+        interrupted = True
+        console.print("\n[yellow]Stopped early (Ctrl+C) - here's the stability summary so far:[/yellow]")
 
     console.print()
-    summarize(host, target_display, rows, mode)
+    summarize(host, target_display, rows, mode, detector=detector, interrupted=interrupted)
 
-    if port is None and all(ms is None for _, ms in rows):
+    if port is None and rows and all(ms is None for _, ms in rows):
         console.print(
             "\n[yellow]Tip: every ICMP ping timed out.[/yellow] Many servers (including most "
             "Minecraft hosts) block ICMP but keep the game port open - retry with e.g. "
